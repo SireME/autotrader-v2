@@ -70,11 +70,11 @@ class OrderMeta:
     sl_ref: float   # original SL (reference only)
     tp:     float   # this order's TP target
 
-COMMENT_RE = re.compile(r'E:([\d.]+)\|SL:([\d.]+)\|TP:([\d.]+)')
+COMMENT_RE = re.compile(r'E:(\d+)\|SL:(\d+)\|TP:(\d+)')
 
 def parse_comment(comment: str) -> Optional[OrderMeta]:
     """Extract fixed reference data from order comment. Returns None if not a bot order."""
-    if "TelegramBot_" not in comment:
+    if not comment.startswith("B_TP"):
         return None
     m = COMMENT_RE.search(comment)
     if not m:

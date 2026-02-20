@@ -358,7 +358,7 @@ class MT5Broker(BrokerInterface):
                 "tp":           tp_validated,
                 "deviation":    20,
                 "magic":        10001,
-                "comment":      f"TelegramBot_{tp_label}|E:{order_price:.2f}|SL:{sl_validated:.2f}|TP:{tp_validated:.2f}|STAGE:0",
+                "comment":      f"B_{tp_label}|E:{order_price:.0f}|SL:{sl_validated:.0f}|TP:{tp_validated:.0f}",
                 "type_filling": filling_mode,
                 "type_time":    mt5.ORDER_TIME_GTC,
             }
