@@ -1,0 +1,799 @@
+"""
+Intent-Aware Trading Signal Parser - AI-Enhanced v2.6
+====================================================
+
+Changes in v2.6:
+- Fallback SL/TP now mirrors provider's observed scalping pattern:
+    XAUUSD: SL = 3 points, TP1 = 5pts, TP2 = 7pts, TP3 = 9pts (matches explicit signals)
+  Previously used percentage-based fallback which was 5-8x too wide.
+- _fallback_risk() now returns 3 TPs for XAUUSD to support multi-order execution.
+- SymbolConfig extended with fixed_sl_points / tp_points list for point-based configs.
+
+Changes in v2.5:
+- Fix 1: Detect and reject hallucinated AI default values (entry=2050.5, sl=2044.0 etc.)
+- Fix 2: Require at least one price number before calling AI
+- Fix 3: Tightened AI prompt
+- Fix 4: Improved celebration/reaction message rejection
+
+Changes in v2.4:
+- Removed symbol restrictions - now accepts ANY trading symbol
+- Dynamic fallback risk calculations based on symbol type
+- Enhanced market order support: "BUY NOW" / "SELL NOW" commands
+
+License: MIT
+"""
+
+import re
+import os
+import json
+from typing import Optional, Dict, List, Callable, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+import logging
+from dotenv import load_dotenv
+load_dotenv()
+
+
+# =========================
+# Logging Setup
+# =========================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =========================
+# Data Models
+# =========================
+
+@dataclass
+class SymbolConfig:
+    aliases: List[str]
+    min_price: float
+    max_price: float
+    sl_pct: float
+    tp_pct: float
+    typical_spread_pct: float
+    # Optional fixed point-based SL/TP (overrides pct-based when set).
+    # Units are raw price points (e.g. 3.0 means 3 points on Gold = $3).
+    fixed_sl_points: float = 0.0
+    fixed_tp_points: List[float] = None
+
+    def __post_init__(self):
+        if self.fixed_tp_points is None:
+            self.fixed_tp_points = []
+
+
+# =========================
+# Signal Parser
+# =========================
+
+class SignalParser:
+    """
+    Intent-aware Telegram signal parser with AI enhancement.
+    """
+
+    BUY_KEYWORDS = {
+        "BUY", "LONG", "BULL", "BULLISH",
+        "BUY NOW", "BUY MARKET", "GO LONG",
+        "OPEN BUY", "ENTRY BUY",
+    }
+
+    SELL_KEYWORDS = {
+        "SELL", "SHORT", "BEAR", "BEARISH",
+        "SELL NOW", "SELL MARKET", "GO SHORT",
+        "OPEN SELL", "ENTRY SELL",
+    }
+
+    MARKET_KEYWORDS = {"NOW", "MARKET", "IMMEDIATE", "INSTANTLY"}
+
+    # Keywords that indicate NOT a trading signal
+    REJECT_KEYWORDS = {
+        "CLOSED", "CLOSE MANUALLY", "MARKET UPDATE", "ANALYSIS",
+        "FORECAST", "PREDICTION", "OUTLOOK", "REVIEW",
+        "SUMMARY", "REPORT", "NEWS", "ANNOUNCEMENT",
+        "EDUCATIONAL", "LESSON", "TUTORIAL", "EXPLANATION",
+        "OPINION", "THOUGHT", "IDEA", "MAYBE", "MIGHT",
+        "COULD", "SHOULD", "WOULD", "POTENTIAL",
+        "WATCH", "MONITOR", "OBSERVE", "WAIT",
+        "PROFIT TAKEN", "HIT TP", "REACHED TARGET",
+        "GOOD MORNING", "GOOD NIGHT", "HELLO", "HI",
+        "THANK YOU", "THANKS", "CONGRATS", "CONGRATULATIONS",
+    }
+
+    # Patterns that indicate celebration/reaction messages — never real signals
+    CELEBRATION_PATTERNS = [
+        r'\bTP\s*\d+\s*(?:CHECK|HIT|DONE|✅)',
+        r'\bTAKEPROFIT\s*\d+',
+        r'\bBREAKEVEN\b',
+        r'\b(?:AMAZING|AWESOME|GREAT|NICE)\s+(?:TRADE|SIGNAL|WORK)\b',
+        r'(?:✅){2,}',           # multiple checkmarks
+        r'(?:🤑){2,}',           # multiple money emojis
+        r'\bEARLY\s+BIRDS?\b',
+        r'\bREADY\s*(?:CHECK|SIGNAL)\b',
+        r'\bWAKE\s+UP\b',
+        r'\bPM\s+ME\b',
+        r'\bMESSAGE\s+ME\b',
+        r'\b(?:VIP|PUBLIC)\s+CHANNEL\b',
+        r'\bFILL\s+THE\s+FORM\b',
+        r'\bDEPOSIT\s+BONUS\b',
+    ]
+
+    # Known AI hallucination default values — Groq returns these when it has no real data
+    # Format: (entry_rounded_1dp, sl_rounded_1dp)
+    AI_HALLUCINATED_DEFAULTS = {
+        (2050.5, 2044.0),   # old XAUUSD default
+        (1305.0, 1304.0),   # old GBPUSD-style default
+        (1.3,    1.3),      # generic FX default
+        (1.2,    1.2),
+    }
+
+    # Default configurations for known symbols
+    KNOWN_SYMBOL_CONFIGS = {
+        "XAUUSD": SymbolConfig(
+            aliases=["XAUUSD", "XAU", "GOLD"],
+            min_price=2000.0,
+            max_price=6000.0,
+            sl_pct=0.003,          # kept as fallback if fixed_sl_points not set
+            tp_pct=0.006,
+            typical_spread_pct=0.0002,
+            # Provider pattern observed: 3pt SL, TP1=+5, TP2=+7, TP3=+9
+            # Matches explicit signals: SL 3pts below entry, TPs at +5/+7/+9
+            fixed_sl_points=3.0,
+            fixed_tp_points=[5.0, 7.0, 9.0],
+        ),
+        "EURUSD": SymbolConfig(
+            aliases=["EURUSD", "EU", "EUR"],
+            min_price=0.8,
+            max_price=1.3,
+            sl_pct=0.0015,
+            tp_pct=0.003,
+            typical_spread_pct=0.00001
+        ),
+        "GBPUSD": SymbolConfig(
+            aliases=["GBPUSD", "GU", "GBP", "CABLE"],
+            min_price=1.0,
+            max_price=1.5,
+            sl_pct=0.0015,
+            tp_pct=0.003,
+            typical_spread_pct=0.00001
+        ),
+        "USDJPY": SymbolConfig(
+            aliases=["USDJPY", "UJ", "USD/JPY"],
+            min_price=100.0,
+            max_price=160.0,
+            sl_pct=0.002,
+            tp_pct=0.004,
+            typical_spread_pct=0.00015
+        ),
+    }
+
+    # Minimum confidence threshold for non-market signals.
+    # Pure market commands (BUY NOW / SELL NOW) use a lower threshold of 0.5
+    # since fallback SL/TP and live price are expected and intentional.
+    MIN_CONFIDENCE_THRESHOLD = 0.6
+
+    # =========================
+    # Initialization
+    # =========================
+
+    def __init__(self, price_provider: Callable[[str], float], groq_api_key: Optional[str] = None):
+        self.price_provider = price_provider
+        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+        self.ai_enabled = bool(self.groq_api_key)
+
+        if self.ai_enabled:
+            logger.info("✨ AI-enhanced parsing enabled (Groq)")
+            self._init_groq_client()
+        else:
+            logger.info("📋 Regex-only parsing (no Groq API key found)")
+
+    def _init_groq_client(self):
+        try:
+            from groq import Groq
+            self.groq_client = Groq(api_key=self.groq_api_key)
+            logger.info("Groq client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Groq client: {e}")
+            self.ai_enabled = False
+
+    # =========================
+    # Symbol Configuration Helpers
+    # =========================
+
+    @staticmethod
+    def _get_symbol_config(symbol: str) -> SymbolConfig:
+        if symbol in SignalParser.KNOWN_SYMBOL_CONFIGS:
+            return SignalParser.KNOWN_SYMBOL_CONFIGS[symbol]
+
+        symbol_upper = symbol.upper()
+
+        if "XAU" in symbol_upper or "GOLD" in symbol_upper:
+            return SymbolConfig(
+                aliases=[symbol], min_price=1000.0, max_price=10000.0,
+                sl_pct=0.003, tp_pct=0.006, typical_spread_pct=0.0002
+            )
+        elif "XAG" in symbol_upper or "SILVER" in symbol_upper:
+            return SymbolConfig(
+                aliases=[symbol], min_price=10.0, max_price=100.0,
+                sl_pct=0.004, tp_pct=0.008, typical_spread_pct=0.0003
+            )
+        elif "BTC" in symbol_upper or "ETH" in symbol_upper or "CRYPTO" in symbol_upper:
+            return SymbolConfig(
+                aliases=[symbol], min_price=0.0, max_price=1000000.0,
+                sl_pct=0.01, tp_pct=0.02, typical_spread_pct=0.001
+            )
+        elif "JPY" in symbol_upper:
+            return SymbolConfig(
+                aliases=[symbol], min_price=50.0, max_price=200.0,
+                sl_pct=0.002, tp_pct=0.004, typical_spread_pct=0.00015
+            )
+        else:
+            return SymbolConfig(
+                aliases=[symbol], min_price=0.01, max_price=100.0,
+                sl_pct=0.002, tp_pct=0.004, typical_spread_pct=0.00002
+            )
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        if not symbol:
+            return ""
+        symbol = symbol.upper().replace("/", "").replace(" ", "").replace("-", "").replace("_", "")
+        alias_map = {
+            "EU": "EURUSD", "GU": "GBPUSD", "UJ": "USDJPY",
+            "AU": "AUDUSD", "UC": "USDCAD", "NU": "NZDUSD",
+            "EJ": "EURJPY", "GJ": "GBPJPY",
+            "XAU": "XAUUSD", "GOLD": "XAUUSD",
+            "XAG": "XAGUSD", "SILVER": "XAGUSD",
+        }
+        if symbol in alias_map:
+            return alias_map[symbol]
+        return symbol
+
+    # =========================
+    # Public API
+    # =========================
+
+    def parse(self, message: str, use_ai: bool = True) -> Optional[Dict]:
+        """
+        Parse a trading signal from a message.
+        Returns None if the message is not a valid trading signal.
+        """
+        if not message or len(message.strip()) < 5:
+            logger.info("❌ Message too short to be a valid signal")
+            return None
+
+        # Quick rejection check
+        if self._is_non_signal_message(message):
+            logger.info("❌ Message identified as non-signal content")
+            return None
+
+        # ── FIX 2: Require a real price number before calling AI ──────────────
+        # Market commands (BUY NOW / SELL NOW) are exempt — they use live price
+        has_price_number = bool(re.search(r'\b\d{3,6}(?:\.\d+)?\b', message))
+        has_market_command = bool(
+            re.search(r'\b(?:BUY|SELL)\s+(?:\w+\s+)?NOW\b', message.upper()) or
+            re.search(r'\b(?:BUY|SELL)\s+MARKET\b', message.upper())
+        )
+
+        if not has_price_number and not has_market_command:
+            logger.info("❌ No price numbers found — not a signal")
+            return None
+        # ─────────────────────────────────────────────────────────────────────
+
+        if self.ai_enabled and use_ai:
+            logger.info("🤖 Attempting AI parsing...")
+            result = self._parse_with_ai(message)
+            if result:
+                result["metadata"]["parsing_method"] = "ai"
+                result["confidence"] = min(1.0, result["confidence"] + 0.1)
+
+                # Market commands ("Gold buy now") are explicitly validated upstream
+                # by the BUY NOW / SELL NOW detector — don't penalise them for
+                # using live price and fallback SL/TP (that's expected behaviour).
+                is_explicit_market_cmd = result.get("order_type") == "market" and \
+                    result.get("metadata", {}).get("used_market_price", False)
+
+                threshold = 0.5 if is_explicit_market_cmd else self.MIN_CONFIDENCE_THRESHOLD
+                if result["confidence"] < threshold:
+                    logger.warning(f"❌ Signal rejected: confidence {result['confidence']:.2f} < {threshold}")
+                    return None
+
+                return result
+            logger.warning("AI parsing failed, falling back to regex")
+
+        logger.info("📋 Using regex parsing")
+        result = self._parse_with_regex(message)
+        if result:
+            result["metadata"]["parsing_method"] = "regex"
+
+            is_explicit_market_cmd = result.get("order_type") == "market" and \
+                result.get("metadata", {}).get("used_market_price", False)
+            threshold = 0.5 if is_explicit_market_cmd else self.MIN_CONFIDENCE_THRESHOLD
+            if result["confidence"] < threshold:
+                logger.warning(f"❌ Signal rejected: confidence {result['confidence']:.2f} < {threshold}")
+                return None
+
+        return result
+
+    def _is_non_signal_message(self, message: str) -> bool:
+        """
+        Quick check to identify messages that are clearly NOT trading signals.
+        """
+        text = message.upper()
+
+        # Check for rejection keywords
+        for keyword in self.REJECT_KEYWORDS:
+            if keyword in text:
+                logger.info(f"Rejected due to keyword: {keyword}")
+                return True
+
+        # Check for celebration/reaction patterns — these are never real signals
+        for pattern in self.CELEBRATION_PATTERNS:
+            if re.search(pattern, text):
+                logger.info(f"Rejected due to celebration/reaction pattern: {pattern}")
+                return True
+
+        # Check if it's a market order command
+        has_market_keyword = any(kw in text for kw in self.MARKET_KEYWORDS)
+        has_direction = any(kw in text for kw in self.BUY_KEYWORDS | self.SELL_KEYWORDS)
+
+        if has_market_keyword and has_direction:
+            logger.info("Detected market order command (BUY NOW / SELL NOW)")
+            return False
+
+        # Short messages must have direction + symbol to proceed
+        if len(message) < 20:
+            has_symbol = bool(re.search(r'\b[A-Z]{3,8}(?:USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD)?\b', text))
+            has_price = bool(re.search(r'\d+\.?\d*', text))
+
+            if has_direction and has_symbol:
+                logger.info("Short message but has direction + symbol - treating as potential signal")
+                return False
+
+            if not (has_direction and has_symbol and has_price):
+                logger.info("Message too short and missing essential signal elements")
+                return True
+
+        # Informational / historical messages
+        has_question = '?' in text
+        has_past_tense = any(word in text for word in ['CLOSED', 'WAS', 'WERE', 'HAD', 'DID', 'REACHED', 'HIT'])
+
+        if has_question or has_past_tense:
+            has_clear_signal = bool(re.search(r'(?:ENTRY|STOP\s*LOSS|TAKE\s*PROFIT|TP|SL)', text))
+            if not has_clear_signal:
+                logger.info("Message is informational/historical, not a new signal")
+                return True
+
+        return False
+
+    # =========================
+    # AI Parsing
+    # =========================
+
+    def _parse_with_ai(self, message: str) -> Optional[Dict]:
+        prompt = self._create_ai_prompt(message)
+
+        try:
+            response = self.groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict trading signal parser. "
+                            "Only parse messages that are EXPLICIT, ACTIONABLE trading signals. "
+                            "Return ONLY valid JSON. No markdown. No explanation. "
+                            "NEVER invent or assume prices — only use values explicitly stated in the message. "
+                            "If the message is not a clear trading signal, return: {\"valid_signal\": false}"
+                        )
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,   # zero temperature — no creativity
+                max_tokens=500,
+            )
+
+            ai_output = response.choices[0].message.content.strip()
+
+            if not ai_output.startswith("{"):
+                logger.error("AI returned non-JSON output")
+                return None
+
+            parsed = json.loads(ai_output)
+
+            if parsed.get("valid_signal") == False:
+                logger.info("❌ AI determined this is not a valid trading signal")
+                return None
+
+            return self._process_ai_output(parsed, message)
+
+        except Exception as e:
+            logger.error(f"AI parsing error: {e}")
+            return None
+
+    def _create_ai_prompt(self, message: str) -> str:
+        return f"""
+Parse the following message ONLY if it satisfies ALL three conditions:
+1. Contains a clear BUY or SELL direction word
+2. Contains a recognizable trading symbol (e.g. GOLD, XAUUSD, EURUSD)
+3. Contains at least one EXPLICIT price number in the message text
+
+Return {{"valid_signal": false}} immediately if ANY of the following apply:
+- No real price number is present in the message
+- The message is a celebration or reaction ("TP1 hit!", "3 TakeProfits!", "blues!", "checkk!")
+- The message is a readiness/engagement prompt ("ready check", "message me", "PM me", "wake up")
+- The message is a greeting, thank you, or general commentary
+- The message announces a previously closed trade
+- You would need to INVENT or ASSUME any price value
+
+Message:
+{message}
+
+ENTRY RANGE RULE (critical):
+If the entry is a range like "5017 – 5020" or "5010.2 - 5007":
+  - For BUY:  entry = the SMALLER number, entry_high = the LARGER number
+              Example: "Buy 5007 - 5010" → entry=5007, entry_high=5010
+  - For SELL: entry = the LARGER number, entry_high = the SMALLER number
+              Example: "Sell 5017 - 5020" → entry=5020, entry_high=5017
+              Example: "Sell 5020 - 5017" → entry=5020, entry_high=5017
+If only a single entry price, set entry = that price, entry_high = null.
+
+STOP LOSS — accept any of: SL: 1234 | Sl 1234 | sl 1234 | Stop 1234 | S/L 1234
+TAKE PROFIT — accept any of: TP: 1234 | tp 1234 | Target 1234 | T/P 1234
+Ignore "TP: open" — not a price.
+
+If valid, return ONLY values explicitly in the message:
+{{
+  "valid_signal": true,
+  "symbol": "XAUUSD",
+  "direction": "buy",
+  "entry": <lower bound for BUY range, upper for SELL range, single price, or NULL if no price given>,
+  "entry_high": <upper bound for BUY range, lower for SELL, or NULL if no range>,
+  "stop_loss": <from message or null>,
+  "take_profit": [<from message, excluding "open">],
+  "is_market_order": <true if message says "now", "market", or has no entry price — otherwise false>
+}}
+
+CRITICAL: If there is NO price in the message (e.g. "Gold buy now" with no numbers):
+  - Set entry = null
+  - Set entry_high = null  
+  - Set is_market_order = true
+Do NOT invent or assume any prices not explicitly in the message.
+"""
+
+    def _process_ai_output(self, data: Dict, raw: str) -> Optional[Dict]:
+        if data.get("valid_signal") == False:
+            return None
+
+        symbol = self._map_symbol_alias(data.get("symbol"))
+        direction = (data.get("direction") or "").lower()
+        entry = data.get("entry")
+        entry_high = data.get("entry_high", entry)
+        sl = data.get("stop_loss")
+        tp = data.get("take_profit", [])
+        is_market = data.get("is_market_order", False)
+
+        # Treat entry=0 as null — Groq sometimes returns 0 instead of null
+        # for pure market commands like "Gold buy now" with no price
+        if entry == 0:
+            entry = None
+        if entry_high == 0:
+            entry_high = None
+
+        # If no entry price at all, this must be a market order regardless
+        # of what the AI returned for is_market_order
+        if entry is None:
+            is_market = True
+
+        # Compute range width
+        range_width = 0.0
+        if entry is not None and entry_high is not None:
+            range_width = round(abs(float(entry_high) - float(entry)), 5)
+
+        # ── FIX 1: Detect hallucinated AI default values ──────────────────────
+        if entry is not None and sl is not None:
+            key = (round(float(entry), 1), round(float(sl), 1))
+            if key in self.AI_HALLUCINATED_DEFAULTS:
+                logger.info(f"❌ AI returned hallucinated default values (entry={entry}, sl={sl}) — rejecting")
+                return None
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Strict validation
+        if not symbol or direction not in {"buy", "sell"}:
+            logger.warning("❌ Missing or invalid symbol/direction")
+            return None
+
+        used_market_price = False
+        used_fallback_sl = False
+
+        # Use live price for market orders or missing entry
+        if entry is None or is_market:
+            try:
+                entry = self.price_provider(symbol)
+                used_market_price = True
+                is_market = True
+                logger.info(f"✅ Using live market price for {symbol}: {entry}")
+            except Exception as e:
+                logger.error(f"❌ Failed to get live price for {symbol}: {e}")
+                return None
+
+        # Only generate fallback SL/TP if none provided
+        if sl is None or not tp:
+            sl, tp = self._fallback_risk(symbol, direction, entry)
+            used_fallback_sl = True
+            logger.info(f"✅ Auto-configured SL/TP: SL={sl}, TP={tp}")
+
+        if entry is None or sl is None:
+            logger.warning("❌ Could not determine entry or stop loss")
+            return None
+
+        if not self._validate_price_logic(symbol, direction, entry, sl):
+            logger.warning("❌ Price logic validation failed")
+            return None
+
+        confidence = self._calculate_confidence(
+            has_explicit_entry=not used_market_price,
+            has_sl=not used_fallback_sl,
+            has_tp=bool(tp) and not used_fallback_sl,
+            is_market=is_market
+        )
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": round(entry, 5),
+            "stop_loss": round(sl, 5),
+            "take_profit": [round(x, 5) for x in tp],
+            "order_type": "market" if is_market else "limit",
+            "confidence": confidence,
+            "raw": raw,
+            "metadata": {
+                "used_market_price": used_market_price,
+                "used_fallback_sl": used_fallback_sl,
+                "entry_range_width": range_width,
+                "timestamp": datetime.utcnow().isoformat(),
+                "risk_reward_ratio": self._calculate_rr_ratio(entry, sl, tp),
+            }
+        }
+
+    def _map_symbol_alias(self, symbol: Optional[str]) -> Optional[str]:
+        if not symbol:
+            return None
+        normalized = self._normalize_symbol(symbol)
+        if normalized in self.KNOWN_SYMBOL_CONFIGS:
+            return normalized
+        for k, cfg in self.KNOWN_SYMBOL_CONFIGS.items():
+            if normalized in [a.upper().replace("/", "").replace(" ", "") for a in cfg.aliases]:
+                return k
+        if re.match(r'^[A-Z0-9]{3,10}$', normalized):
+            return normalized
+        logger.warning(f"Symbol '{symbol}' doesn't match expected pattern")
+        return None
+
+    # =========================
+    # Regex Parsing (Fallback)
+    # =========================
+
+    def _parse_with_regex(self, message: str) -> Optional[Dict]:
+        raw = message
+        text = self._normalize(message)
+
+        direction = self._detect_direction(text)
+        if not direction:
+            logger.warning("❌ No clear BUY/SELL direction found")
+            return None
+
+        symbol = self._detect_symbol(text)
+        if not symbol:
+            logger.warning("❌ No recognized trading symbol found")
+            return None
+
+        is_market = self._is_market_order(text)
+
+        entry = self._extract_entry(text)
+        sl = self._extract_stop_loss(text)
+        tp = self._extract_take_profits(text)
+
+        used_market_price = False
+        used_fallback_sl = False
+
+        if entry is None or is_market:
+            try:
+                entry = self.price_provider(symbol)
+                used_market_price = True
+                is_market = True
+                logger.info(f"✅ Using live market price for {symbol}: {entry}")
+            except Exception as e:
+                logger.error(f"❌ Failed to get live price for {symbol}: {e}")
+                return None
+
+        if sl is None or not tp:
+            sl, tp = self._fallback_risk(symbol, direction, entry)
+            used_fallback_sl = True
+            logger.info(f"✅ Auto-configured SL/TP: SL={sl}, TP={tp}")
+
+        if entry is None or sl is None:
+            logger.warning("❌ Could not determine entry or stop loss")
+            return None
+
+        if not self._validate_price_logic(symbol, direction, entry, sl):
+            logger.warning("❌ Price logic validation failed")
+            return None
+
+        confidence = self._calculate_confidence(
+            has_explicit_entry=bool(entry) and not used_market_price,
+            has_sl=not used_fallback_sl,
+            has_tp=bool(tp) and not used_fallback_sl,
+            is_market=is_market
+        )
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": round(entry, 5),
+            "stop_loss": round(sl, 5),
+            "take_profit": [round(x, 5) for x in tp],
+            "order_type": "market" if is_market else "limit",
+            "confidence": confidence,
+            "raw": raw,
+            "metadata": {
+                "used_market_price": used_market_price,
+                "used_fallback_sl": used_fallback_sl,
+                "timestamp": datetime.utcnow().isoformat(),
+                "risk_reward_ratio": self._calculate_rr_ratio(entry, sl, tp),
+            }
+        }
+
+    # =========================
+    # Regex Helpers
+    # =========================
+
+    def _normalize(self, text: str) -> str:
+        text = text.upper()
+        text = re.sub(r"(\d),(\d)", r"\1\2", text)
+        text = re.sub(r"[^\w\s.\-@/()\[\]]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return f" {text.strip()} "
+
+    def _detect_direction(self, text: str) -> Optional[str]:
+        buy_hits = sum(kw in text for kw in self.BUY_KEYWORDS)
+        sell_hits = sum(kw in text for kw in self.SELL_KEYWORDS)
+        if buy_hits > sell_hits and buy_hits > 0:
+            return "buy"
+        if sell_hits > buy_hits and sell_hits > 0:
+            return "sell"
+        logger.info(f"Direction unclear: buy_hits={buy_hits}, sell_hits={sell_hits}")
+        return None
+
+    def _detect_symbol(self, text: str) -> Optional[str]:
+        for symbol, cfg in self.KNOWN_SYMBOL_CONFIGS.items():
+            for alias in cfg.aliases:
+                if f" {alias} " in text:
+                    return symbol
+
+        patterns = [
+            r'\b([A-Z]{6})\b',
+            r'\b([A-Z]{3}[/\-][A-Z]{3})\b',
+            r'\b((?:XAU|XAG|BTC|ETH|LTC|XRP)(?:/)?USD)\b',
+            r'\b(GOLD|SILVER)\b',
+            r'\b([A-Z]{2,4}\d{2,3})\b',
+            r'\b([A-Z]{3,8})\b',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                normalized = self._normalize_symbol(match)
+                if normalized and normalized not in (self.BUY_KEYWORDS | self.SELL_KEYWORDS | self.MARKET_KEYWORDS | self.REJECT_KEYWORDS):
+                    if re.match(r'^[A-Z0-9]{3,10}$', normalized):
+                        return normalized
+        return None
+
+    def _extract_entry(self, text: str) -> Optional[float]:
+        # Handle entry range — e.g. "5017 – 5020" or "5010.2 - 5007"
+        # BUY → lower bound, SELL → higher bound
+        range_match = re.search(
+            r'(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)', text
+        )
+        if range_match:
+            a, b = float(range_match.group(1)), float(range_match.group(2))
+            is_buy = bool(re.search(r'\bBUY\b', text, re.IGNORECASE))
+            is_sell = bool(re.search(r'\bSELL\b', text, re.IGNORECASE))
+            if is_buy:
+                return min(a, b)
+            if is_sell:
+                return max(a, b)
+            return min(a, b)  # default to lower if direction unclear
+
+        # Single explicit entry
+        patterns = [
+            r"(?:ENTRY|ENTER|PRICE|@)\s*[:=@]?\s*(\d+\.?\d*)",
+            r"(?:BUY|SELL)\s+(?:AT\s+)?(\d+\.?\d*)"
+        ]
+        for p in patterns:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+        return None
+
+    def _extract_stop_loss(self, text: str) -> Optional[float]:
+        # Handles: SL: 1234 | Sl 1234 | sl 1234 | Stop Loss 1234 | S/L 1234
+        m = re.search(r"(?:S[/\s]?L|STOP\s*LOSS)\s*[:=@]?\s*(\d+\.?\d*)", text, re.IGNORECASE)
+        return float(m.group(1)) if m else None
+
+    def _extract_take_profits(self, text: str) -> List[float]:
+        return [float(x) for x in re.findall(r"(?:TP\d*|TARGET\d*)\s*[:=@]?\s*(\d+\.?\d*)", text)]
+
+    def _is_market_order(self, text: str) -> bool:
+        return any(kw in text for kw in self.MARKET_KEYWORDS)
+
+    # =========================
+    # Validation & Risk
+    # =========================
+
+    def _validate_price_logic(self, symbol: str, direction: str, entry: float, sl: float) -> bool:
+        if entry <= 0 or sl <= 0:
+            logger.warning(f"Invalid prices: entry={entry}, sl={sl}")
+            return False
+        if direction == "buy" and sl >= entry:
+            logger.warning(f"BUY signal has SL ({sl}) >= entry ({entry})")
+            return False
+        if direction == "sell" and sl <= entry:
+            logger.warning(f"SELL signal has SL ({sl}) <= entry ({entry})")
+            return False
+        cfg = self._get_symbol_config(symbol)
+        if not (cfg.min_price <= entry <= cfg.max_price):
+            logger.warning(f"Entry price {entry} outside typical range [{cfg.min_price}, {cfg.max_price}] for {symbol}")
+            if entry <= 0:
+                return False
+        return True
+
+    def _fallback_risk(self, symbol: str, direction: str, entry: float) -> Tuple[float, List[float]]:
+        """
+        Calculate fallback SL and TP.
+
+        If the symbol config has fixed_sl_points / fixed_tp_points set,
+        those are used directly (provider-matched scalping levels).
+        Otherwise falls back to percentage-based calculation.
+
+        For XAUUSD this produces:
+            BUY:  SL = entry - 3,  TP = [entry+5, entry+7, entry+9]
+            SELL: SL = entry + 3,  TP = [entry-5, entry-7, entry-9]
+        """
+        cfg = self._get_symbol_config(symbol)
+
+        if cfg.fixed_sl_points and cfg.fixed_tp_points:
+            # Point-based config — matches provider's observed pattern
+            sl_dist = cfg.fixed_sl_points
+            if direction == "buy":
+                sl = round(entry - sl_dist, 2)
+                tps = [round(entry + tp_pt, 2) for tp_pt in cfg.fixed_tp_points]
+            else:
+                sl = round(entry + sl_dist, 2)
+                tps = [round(entry - tp_pt, 2) for tp_pt in cfg.fixed_tp_points]
+            logger.info(
+                f"✅ Point-based fallback SL/TP for {symbol}: "
+                f"SL={sl} ({sl_dist}pts), TPs={tps} ({cfg.fixed_tp_points}pts)"
+            )
+            return sl, tps
+
+        # Percentage-based fallback for other symbols
+        sl_dist = entry * cfg.sl_pct
+        tp_dist = entry * cfg.tp_pct
+        spread = entry * cfg.typical_spread_pct
+        if direction == "buy":
+            return round(entry - sl_dist - spread, 5), [round(entry + tp_dist, 5)]
+        return round(entry + sl_dist + spread, 5), [round(entry - tp_dist, 5)]
+
+    def _calculate_confidence(self, has_explicit_entry, has_sl, has_tp, is_market) -> float:
+        score = 0.5
+        score += 0.15 if has_explicit_entry else 0.05
+        score += 0.2 if has_sl else 0
+        score += 0.15 if has_tp else 0
+        return min(1.0, max(0.0, score))
+
+    def _calculate_rr_ratio(self, entry: float, sl: float, tp: List[float]) -> Optional[float]:
+        if not tp:
+            return None
+        risk = abs(entry - sl)
+        reward = abs(entry - tp[0])
+        return round(reward / risk, 2) if risk > 0 else None

@@ -1,0 +1,52 @@
+import asyncio
+
+import nest_asyncio
+
+from broker.mt5_connector import MT5Broker
+from config.settings import DEBUG, RISK_SETTINGS, TRADES_DB_PATH
+from core.risk_manager import RiskManager
+from core.signal_parser import SignalParser
+from core.telegram_client import TelegramSignalClient
+from core.trade_engine import TradeEngine
+from utils.market_data import get_live_price
+from utils.trade_repository import TradeRepository
+
+nest_asyncio.apply()
+
+print("🔄 Connecting to MT5 …")
+broker = MT5Broker()
+broker.connect()
+
+risk_manager = RiskManager(
+    balance=1000,
+    risk_per_trade=RISK_SETTINGS["max_risk_per_trade"],
+    max_daily_loss=RISK_SETTINGS["max_daily_loss"],
+    max_open_trades=RISK_SETTINGS["max_open_trades"],
+)
+
+trade_repository = TradeRepository(TRADES_DB_PATH)
+engine = TradeEngine(broker, risk_manager, trade_repository=trade_repository)
+parser = SignalParser(price_provider=get_live_price)
+
+
+async def on_signal(raw_text: str):
+    try:
+        signal = parser.parse(raw_text)
+        if signal is None:
+            if DEBUG:
+                print("🔍 Message didn't match signal format — skipped.")
+            return
+        if DEBUG:
+            print(f"📊 Parsed signal: {signal}")
+        engine.process_signal(signal)
+    except Exception as exc:
+        print(f"⚠️  Signal processing error: {exc}")
+
+
+async def async_main():
+    client = TelegramSignalClient(on_signal)
+    await client.start()
+
+
+if __name__ == "__main__":
+    asyncio.run(async_main())
