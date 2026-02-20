@@ -238,20 +238,47 @@ class MT5Broker(BrokerInterface):
 
         # ── FIX 4: Block hallucinated signals ────────────────
         used_fallback = trade.get("metadata", {}).get("used_fallback_sl", False)
+        is_market_cmd = trade.get("metadata", {}).get("used_market_price", False)
 
-        if used_fallback:
-            entry_deviation = abs(signal_entry - live_price) / live_price
-            if entry_deviation > MAX_ENTRY_DEVIATION_FOR_FALLBACK:
-                raise RuntimeError(
-                    f"❌ Blocked hallucinated signal: entry {signal_entry} is "
-                    f"{entry_deviation*100:.1f}% from live price {live_price} "
-                    f"with fallback SL/TP — not executing."
-                )
+        # Block signals where AI hallucinated an entry from commentary text.
+        # These will have used_fallback_sl=True but NOT be explicit market commands.
+        # Real signals either: (a) have explicit SL/TP, or (b) are "buy/sell now" market cmds.
+        if used_fallback and not is_market_cmd:
+            raise RuntimeError(
+                f"❌ Blocked likely hallucinated signal — fallback SL/TP used on "
+                f"non-market-command message: '{trade.get('raw', '')[:60]}'"
+            )
 
         # ── build TP list ────────────────────────────────────
         all_tps = trade.get("take_profit", [])
         if not all_tps:
             all_tps = [0.0]
+
+        # ── filter TPs that are still valid at execution price ──
+        # When live price is above signal entry (common for ranged signals),
+        # early TPs may already be below the ask — MT5 rejects these.
+        # Skip invalid TPs and use only those still ahead of live price.
+        valid_tps = []
+        min_tp_dist = min_stop_dist  # same minimum distance as SL
+        for tp_candidate in all_tps:
+            if tp_candidate == 0.0:
+                valid_tps.append(tp_candidate)
+                continue
+            if is_buy and tp_candidate > live_price + min_tp_dist:
+                valid_tps.append(tp_candidate)
+            elif not is_buy and tp_candidate < live_price - min_tp_dist:
+                valid_tps.append(tp_candidate)
+            else:
+                print(f"⏭️  Skipping TP {tp_candidate} — already {'below' if is_buy else 'above'} "
+                      f"execution price {live_price} (min dist={min_tp_dist:.2f}pts)")
+
+        if not valid_tps:
+            raise RuntimeError(
+                f"❌ No valid TPs remain after filtering against live price {live_price}. "
+                f"All TPs already passed. Signal entry zone too far from current market."
+            )
+        all_tps = valid_tps
+        print(f"✅ Valid TPs after filtering: {all_tps}")
 
         # ── determine filling mode ────────────────────────
         # All orders are now market orders — no more pending limits.
@@ -331,7 +358,7 @@ class MT5Broker(BrokerInterface):
                 "tp":           tp_validated,
                 "deviation":    20,
                 "magic":        10001,
-                "comment":      f"TelegramBot_{tp_label}",
+                "comment":      f"TelegramBot_{tp_label}|E:{order_price:.2f}|SL:{sl_validated:.2f}|TP:{tp_validated:.2f}|STAGE:0",
                 "type_filling": filling_mode,
                 "type_time":    mt5.ORDER_TIME_GTC,
             }
