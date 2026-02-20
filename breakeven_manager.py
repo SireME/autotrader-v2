@@ -38,13 +38,10 @@ Usage in main.py:
 
 import asyncio
 import re
-import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import MetaTrader5 as mt5
-
-logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────
 CHECK_INTERVAL_SECONDS = 1
@@ -144,15 +141,18 @@ class BreakevenManager:
 
     async def run(self):
         self._running = True
-        logger.info(
-            f"🔒 SL Manager v4 (inference) | {self.check_interval}s | "
-            f"trail={TRAIL_PTS}pts | step={TRAIL_STEP_PTS}pt | BE_buf={BE_BUFFER_PTS}pt"
+        print(
+            f"🔒 SL Manager started | "
+            f"interval={self.check_interval}s | "
+            f"trail={TRAIL_PTS}pts | "
+            f"step={TRAIL_STEP_PTS}pt | "
+            f"BE buffer={BE_BUFFER_PTS}pt"
         )
         while self._running:
             try:
                 self._scan()
             except Exception as e:
-                logger.error(f"⚠️  SL Manager error: {e}")
+                print(f"⚠️  SL Manager error: {e}")
             await asyncio.sleep(self.check_interval)
 
     def stop(self):
@@ -206,20 +206,21 @@ class BreakevenManager:
 
     def _handle_watching(self, pos, meta: OrderMeta, price: float,
                          is_buy: bool, digits: int, pt: float, tick):
-        """Price hasn't reached TP yet — do nothing until it does."""
         if not self._hit(is_buy, price, meta.tp):
             return
 
-        # TP reached → move SL to entry (breakeven)
         buf    = BE_BUFFER_PTS * pt * 100
         new_sl = round(meta.entry + (buf if is_buy else -buf), digits)
 
         if self._modify(pos, new_sl, tick, pt, digits, is_buy):
-            logger.info(
-                f"🔒 [0→BE] ticket={pos.ticket} {pos.symbol} | "
-                f"TP {meta.tp:.{digits}f} hit @ {price:.{digits}f} | "
-                f"SL {pos.sl:.{digits}f} → {new_sl:.{digits}f} "
-                f"(entry {meta.entry:.{digits}f}, zero risk)"
+            direction = "BUY" if is_buy else "SELL"
+            print(
+                f"\n{'─'*45}\n"
+                f"🔒 BREAKEVEN SET\n"
+                f"   Ticket : {pos.ticket}  {pos.symbol} {direction}\n"
+                f"   TP hit : {meta.tp:.{digits}f}  (price @ {price:.{digits}f})\n"
+                f"   SL     : {pos.sl:.{digits}f} → {new_sl:.{digits}f}  (entry, zero risk)\n"
+                f"{'─'*45}"
             )
 
     # ─────────────────────────────────────────
@@ -235,10 +236,7 @@ class BreakevenManager:
         """
         if pos.ticket not in self._trail:
             self._trail[pos.ticket] = TrailState(trail_peak=price)
-            logger.info(
-                f"🏃 [BE→TRAIL] ticket={pos.ticket} | "
-                f"trail starts @ {price:.{digits}f}"
-            )
+            print(f"🏃 TRAILING STARTED  ticket={pos.ticket} | peak={price:.{digits}f} | trail={TRAIL_PTS}pts behind price")
         # Fall through to trailing logic immediately
         self._handle_trailing(pos, meta, price, is_buy, digits, pt, tick)
 
@@ -253,10 +251,7 @@ class BreakevenManager:
         # Initialise trail state if not present (e.g. after bot restart)
         if pos.ticket not in self._trail:
             self._trail[pos.ticket] = TrailState(trail_peak=price)
-            logger.info(
-                f"🔄 [TRAIL resume] ticket={pos.ticket} | "
-                f"restarted — trail peak initialised @ {price:.{digits}f}"
-            )
+            print(f"🔄 TRAIL RESUMED     ticket={pos.ticket} | peak reset @ {price:.{digits}f} (bot restarted)")
 
         state = self._trail[pos.ticket]
 
@@ -270,12 +265,7 @@ class BreakevenManager:
 
             if desired_sl > pos.sl and advance >= TRAIL_STEP_PTS * pt * 100:
                 if self._modify(pos, desired_sl, tick, pt, digits, is_buy):
-                    logger.info(
-                        f"📈 [TRAIL↑] ticket={pos.ticket} | "
-                        f"price={price:.{digits}f} "
-                        f"peak={state.trail_peak:.{digits}f} | "
-                        f"SL {pos.sl:.{digits}f} → {desired_sl:.{digits}f}"
-                    )
+                    print(f"📈 TRAIL ↑           ticket={pos.ticket} | price={price:.{digits}f}  peak={state.trail_peak:.{digits}f} | SL {pos.sl:.{digits}f} → {desired_sl:.{digits}f}")
         else:
             if state.trail_peak == 0.0 or price < state.trail_peak:
                 state.trail_peak = price
@@ -287,12 +277,7 @@ class BreakevenManager:
             if (cur_sl == 0.0 or desired_sl < cur_sl) and \
                advance >= TRAIL_STEP_PTS * pt * 100:
                 if self._modify(pos, desired_sl, tick, pt, digits, is_buy):
-                    logger.info(
-                        f"📉 [TRAIL↓] ticket={pos.ticket} | "
-                        f"price={price:.{digits}f} "
-                        f"peak={state.trail_peak:.{digits}f} | "
-                        f"SL {pos.sl:.{digits}f} → {desired_sl:.{digits}f}"
-                    )
+                    print(f"📉 TRAIL ↓           ticket={pos.ticket} | price={price:.{digits}f}  peak={state.trail_peak:.{digits}f} | SL {pos.sl:.{digits}f} → {desired_sl:.{digits}f}")
 
     # ─────────────────────────────────────────
     # MT5 modification
@@ -322,17 +307,11 @@ class BreakevenManager:
         })
 
         if result is None:
-            logger.warning(
-                f"⚠️  Modify failed ticket={pos.ticket}: "
-                f"order_send()=None — {mt5.last_error()}"
-            )
+            print(f"⚠️  SL modify failed  ticket={pos.ticket}: order_send()=None — {mt5.last_error()}")
             return False
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.warning(
-                f"⚠️  Modify rejected ticket={pos.ticket}: "
-                f"retcode={result.retcode} {result.comment}"
-            )
+            print(f"⚠️  SL modify rejected ticket={pos.ticket}: retcode={result.retcode} {result.comment}")
             return False
 
         return True
