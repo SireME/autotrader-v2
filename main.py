@@ -8,7 +8,7 @@ from core.signal_parser import SignalParser
 from core.telegram_client import TelegramSignalClient
 from core.trade_engine import TradeEngine
 from utils.trade_repository import TradeRepository
-from breakeven_manager import BreakevenManager          # ← NEW
+from breakeven_manager import BreakevenManager
 import MetaTrader5 as mt5
 
 nest_asyncio.apply()
@@ -60,11 +60,17 @@ async def on_signal(raw_text: str):
 
 
 async def async_main():
-    bm = BreakevenManager()                            # ← NEW
-    asyncio.create_task(bm.run())                      # ← NEW
+    bm = BreakevenManager()
+    # Hold a reference to the task so it isn't silently garbage collected.
+    bm_task = asyncio.create_task(bm.run())
 
-    client = TelegramSignalClient(on_signal)
-    await client.start()
+    try:
+        client = TelegramSignalClient(on_signal)
+        await client.start()
+    finally:
+        # Graceful shutdown: stop the manager loop and await task completion.
+        bm.stop()
+        await bm_task
 
 
 if __name__ == "__main__":
