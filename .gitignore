@@ -1,0 +1,65 @@
+# =========================
+# Python bytecode & caches
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.env.*
+.pyenv/
+pip-wheel-metadata/
+
+# =========================
+# Sensitive / secrets
+# =========================
+**/.env
+telegram_session.session
+
+# =========================
+# Database & runtime data
+# =========================
+data/*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+*.out
+
+# =========================
+# IDE / Editor configs
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# OS-specific files
+# =========================
+Thumbs.db
+
+# =========================
+# Test artifacts (optional)
+# =========================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# =========================
+# Build / distribution
+# =========================
+build/
+dist/
+*.egg-info/
+
