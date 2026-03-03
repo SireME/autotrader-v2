@@ -34,15 +34,15 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
 
 RISK_SETTINGS = {
-    "max_risk_per_trade": _to_float(os.getenv("MAX_RISK_PER_TRADE"), 0.01),
-    "max_daily_loss": _to_float(os.getenv("MAX_DAILY_LOSS"), 0.05),
-    "max_open_trades": _to_int(os.getenv("MAX_OPEN_TRADES"), 3),
+    "max_risk_per_trade": _to_float(os.getenv("MAX_RISK_PER_TRADE"), 0.07),
+    "max_daily_loss": _to_float(os.getenv("MAX_DAILY_LOSS"), 0.2),
+    "max_open_trades": _to_int(os.getenv("MAX_OPEN_TRADES"), 1),
 }
 
 MIN_CONFIDENCE = _to_float(os.getenv("MIN_CONFIDENCE"), 0.6)
 LOT_SIZE = os.getenv("LOT_SIZE")
 LOT_SIZE = _to_float(LOT_SIZE, 0.0) if LOT_SIZE else None
-MAX_LOT_SIZE = _to_float(os.getenv("MAX_LOT_SIZE"), 0.02)
+MAX_LOT_SIZE = _to_float(os.getenv("MAX_LOT_SIZE"), 0.07)
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 TRADES_DB_PATH = os.getenv("TRADES_DB_PATH", os.path.join(DATA_DIR, "trades.db"))
