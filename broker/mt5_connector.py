@@ -7,9 +7,9 @@ from config.symbols import get_broker_symbol, SYMBOL_ALIASES
 
 
 # If the signal's SL or TP is more than this % from live price, it's stale/hallucinated.
-MAX_PRICE_DEVIATION = os.getenv("MAX_PRICE_DEVIATION")   # 5%
-MAX_LOT_SIZE = os.getenv("MAX_LOT_SIZE")           # Maximum allowed lot size
-LOT_SIZE = os.getenv("LOT_SIZE")               # If set, this lot size will be enforced
+MAX_PRICE_DEVIATION = float(os.getenv("MAX_PRICE_DEVIATION"))   # 5%
+MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE"))           # Maximum allowed lot size
+LOT_SIZE = float((os.getenv("LOT_SIZE")))               # If set, this lot size will be enforced
 
 # If signal entry is more than this % from live price AND fallback SL/TP were used,
 # the signal is almost certainly hallucinated — block it entirely.
