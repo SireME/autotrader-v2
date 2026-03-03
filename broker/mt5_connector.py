@@ -4,6 +4,7 @@ from broker.broker_interface import BrokerInterface
 import os
 
 from config.symbols import get_broker_symbol, SYMBOL_ALIASES
+SPLIT_TP_ORDERS = os.getenv("SPLIT_TP_ORDERS", "true").lower() == "true"
 
 
 # If the signal's SL or TP is more than this % from live price, it's stale/hallucinated.
@@ -13,7 +14,7 @@ LOT_SIZE = float((os.getenv("LOT_SIZE")))               # If set, this lot size 
 
 # If signal entry is more than this % from live price AND fallback SL/TP were used,
 # the signal is almost certainly hallucinated — block it entirely.
-MAX_ENTRY_DEVIATION_FOR_FALLBACK = os.getenv("MAX_ENTRY_DEVIATION_FOR_FALLBACK")  # 10%
+MAX_ENTRY_DEVIATION_FOR_FALLBACK = float(os.getenv("MAX_ENTRY_DEVIATION_FOR_FALLBACK"))  # 10%
 
 
 class MT5Broker(BrokerInterface):
@@ -59,8 +60,11 @@ class MT5Broker(BrokerInterface):
         return symbol_info.point * 10 if symbol_info.digits >= 5 else symbol_info.point
 
     @staticmethod
+    # def round_lot(volume: float, lot_step: float) -> float:
+    #     return round(math.floor(volume / lot_step) * lot_step, 2)
     def round_lot(volume: float, lot_step: float) -> float:
-        return round(math.floor(volume / lot_step) * lot_step, 2)
+        steps = round(volume / lot_step)
+        return round(steps * lot_step, 2)
 
     # ── SL / TP validation & repair ───────────────────────────
     @staticmethod
@@ -297,11 +301,17 @@ class MT5Broker(BrokerInterface):
         # ── calculate per-order volume ────────────────────
         # Split total lot evenly across all TP levels to mirror provider's
         # multi-TP structure (TP1, TP2, TP3 + optional runner).
-        num_orders = len(all_tps)
         base_volume = LOT_SIZE if LOT_SIZE is not None else trade.get("lot_size", 0.01)
         base_volume = min(base_volume, MAX_LOT_SIZE)
 
-        split_volume = self.round_lot(base_volume / num_orders, info.volume_step)
+        if SPLIT_TP_ORDERS:
+            num_orders = len(all_tps)
+            split_volume = self.round_lot(base_volume / num_orders, info.volume_step)
+        else:
+            # Single trade using first TP only
+            num_orders = 1
+            all_tps = [all_tps[0]]
+            split_volume = self.round_lot(base_volume, info.volume_step)
 
         if split_volume < info.volume_min:
             # Split too small for broker — collapse to single order at TP1
